@@ -2,7 +2,7 @@
 """
 generate_test_models.py -- TFLite 테스트 모델 생성기
 FlatBuffer 바이너리를 Python struct 모듈로 직접 빌드한다.
-정상 모델 10개(B001-B010)와 취약점 주입 모델 8개(M001-M008) 생성.
+정상 모델 15개(B001-B015)와 취약점 주입 모델 8개(M001-M008) 생성.
 """
 
 import struct
@@ -90,12 +90,17 @@ class FlatBufferBuilder:
         return self.size()
 
     def create_vector_u8(self, values: list) -> int:
-        """uint8 배열 벡터 (custom_options 등) → OFE 반환"""
+        """uint8 배열 벡터 (Buffer.data 등) → OFE 반환
+        파일 레이아웃: [count(u32)][data bytes...]
+        count 앞에 정렬 패딩이 올 수 있으므로 count 기록 직후 OFE를 캡처해
+        반환한다. (패딩 추가 후의 size()를 반환하면 UOffset이 패딩을 가리킴)
+        """
         for v in reversed(values):
             self._pre(struct.pack('<B', v & 0xFF))
         self._pre(struct.pack('<I', len(values)))
-        self._align(4)
-        return self.size()
+        count_ofe = self.size()   # count 위치 (패딩 추가 전)
+        self._align(4)            # 파일 내 count 4-byte 정렬 보장 (앞쪽 패딩)
+        return count_ofe          # UOffset은 반드시 count를 가리켜야 함
 
     def create_vector_of_offsets(self, ofe_list: list) -> int:
         """
@@ -430,64 +435,55 @@ def make_m001_r001_large_shape() -> bytes:
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
-def make_m002_r001_negative_shape() -> bytes:
-    """M002: R001 -- shape에 -2 삽입 (동적 차원 -1이 아닌 비정상 음수) (CVE-2022-23558)
-    -1은 TFLite 동적 shape 관례이므로 허용하지만, -2 이하는 정수 오버플로 트리거.
-    """
-    b = FlatBufferBuilder()
-    buf_offs = [build_buffer(b), build_buffer(b, b'\x01\x02\x03\x04')]
-    oc_offs  = [build_opcode(b, 0, deprecated=0)]
-
-    t0 = build_tensor(b, 'normal',       [1, 16, 16,  1], buffer_idx=1)
-    t1 = build_tensor(b, 'neg_shape',    [1, -2, 16,  1], buffer_idx=1)  # -2: 비정상 음수
-    t2 = build_tensor(b, 'output',       [1,  4,  4,  1], buffer_idx=1)
-    op = build_operator(b, 0, [0, 1], [2])
-    sg = build_subgraph(b, [t0, t1, t2], [op], [0], [2])
-    return assemble_model(b, oc_offs, [sg], buf_offs)
-
-
-def make_m003_r002_variable_input() -> bytes:
-    """M003: R002 -- is_variable=True 텐서를 연산자 입력으로 사용 (CVE-2021-37681)"""
+def make_m002_r002_variable_input() -> bytes:
+    """M002: R002 -- is_variable=True 텐서를 연산자 입력으로 사용 (CVE-2021-37681)"""
     b = FlatBufferBuilder()
     buf_offs = [build_buffer(b), build_buffer(b, b'\xDE\xAD\xBE\xEF')]
     oc_offs  = [build_opcode(b, 0, deprecated=0)]
 
-    t0 = build_tensor(b, 'normal_in',    [1, 8, 8, 1], buffer_idx=1, is_variable=False)
-    t1 = build_tensor(b, 'variable_in',  [1, 8, 8, 1], buffer_idx=1, is_variable=True)
-    t2 = build_tensor(b, 'output',       [1, 8, 8, 1], buffer_idx=1, is_variable=False)
-    # t1 (is_variable=True) 을 입력으로 직접 참조 → R002 탐지
+    t0 = build_tensor(b, 'normal_in',   [1, 8, 8, 1], buffer_idx=1, is_variable=False)
+    t1 = build_tensor(b, 'variable_in', [1, 8, 8, 1], buffer_idx=1, is_variable=True)
+    t2 = build_tensor(b, 'output',      [1, 8, 8, 1], buffer_idx=1, is_variable=False)
     op = build_operator(b, 0, [0, 1], [2])
     sg = build_subgraph(b, [t0, t1, t2], [op], [0], [2])
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
-def make_m004_r003_buffer0_output() -> bytes:
-    """M004: R003 -- buffer_idx=0 텐서를 연산자 출력으로 지정 (CVE-2021-29606)"""
+def make_m003_r003_splitv_oob() -> bytes:
+    """M003: R003 -- SPLIT_V axis=5, input rank=2 → axis OOB (CVE-2021-29606)"""
+    import struct as _struct
     b = FlatBufferBuilder()
-    buf_offs = [build_buffer(b), build_buffer(b, b'\x01\x02')]
-    oc_offs  = [build_opcode(b, 0, deprecated=0)]
+    # buffer[0]: 빈(관례), buffer[1]: input [4,4] float32, buffer[2]: size_splits=[2,2], buffer[3]: axis=5
+    buf_offs = [
+        build_buffer(b),
+        build_buffer(b, bytes(64)),                         # 4*4*4 = 64 bytes float32
+        build_buffer(b, _struct.pack('<2i', 2, 2)),         # size_splits
+        build_buffer(b, _struct.pack('<i', 5)),             # axis=5 (rank=2 초과 → OOB)
+        build_buffer(b),                                    # output0 (빈)
+        build_buffer(b),                                    # output1 (빈)
+    ]
+    oc_offs = [build_opcode(b, builtin_code=102, deprecated=127)]  # SPLIT_V
 
-    t0 = build_tensor(b, 'input0',    [1, 4, 4, 1], buffer_idx=1)
-    t1 = build_tensor(b, 'input1',    [1, 4, 4, 1], buffer_idx=1)
-    # buffer_idx=0 출력 텐서 → R003 탐지
-    t2 = build_tensor(b, 'out_buf0',  [1, 4, 4, 1], buffer_idx=0)
-    op = build_operator(b, 0, [0, 1], [2])
-    sg = build_subgraph(b, [t0, t1, t2], [op], [0], [2])
+    t0 = build_tensor(b, 'input',       [4, 4], tensor_type=1, buffer_idx=1)   # FLOAT32
+    t1 = build_tensor(b, 'size_splits', [2],    tensor_type=2, buffer_idx=2)   # INT32
+    t2 = build_tensor(b, 'axis',        [],     tensor_type=2, buffer_idx=3)   # INT32 scalar
+    t3 = build_tensor(b, 'output0',     [2, 4], tensor_type=1, buffer_idx=4)
+    t4 = build_tensor(b, 'output1',     [2, 4], tensor_type=1, buffer_idx=5)
+
+    op = build_operator(b, 0, [0, 1, 2], [3, 4])
+    sg = build_subgraph(b, [t0, t1, t2, t3, t4], [op], [0], [3, 4])
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
-def make_m005_r004_sparseadd_mismatch() -> bytes:
-    """M005: R004 -- SparseAdd indices/shape 불일치 (CVE-2021-29609)"""
+def make_m004_r004_sparseadd_mismatch() -> bytes:
+    """M004: R004 -- SparseAdd indices/shape 불일치 (CVE-2021-29609)"""
     b = FlatBufferBuilder()
     buf_offs = [build_buffer(b)] + [build_buffer(b, b'\x01') for _ in range(8)]
-    # SparseAdd custom opcode
     oc_offs = [build_opcode(b, builtin_code=0, custom_code='SparseAdd', deprecated=127)]
 
-    # a_indices.shape = [5, 3] → dim[1]=3
-    # a_shape.shape   = [4]   → size=4  ← 불일치! (3 != 4) → R004 탐지
     t0 = build_tensor(b, 'a_values',  [5],    buffer_idx=1)
     t1 = build_tensor(b, 'a_indices', [5, 3], buffer_idx=2)
-    t2 = build_tensor(b, 'a_shape',   [4],    buffer_idx=3)
+    t2 = build_tensor(b, 'a_shape',   [4],    buffer_idx=3)  # 3 != 4 → R004
     t3 = build_tensor(b, 'b_values',  [3],    buffer_idx=4)
     t4 = build_tensor(b, 'b_indices', [3, 2], buffer_idx=5)
     t5 = build_tensor(b, 'b_shape',   [2],    buffer_idx=6)
@@ -495,6 +491,22 @@ def make_m005_r004_sparseadd_mismatch() -> bytes:
 
     op = build_operator(b, 0, [0, 1, 2, 3, 4, 5], [6])
     sg = build_subgraph(b, [t0, t1, t2, t3, t4, t5, t6], [op], [0], [6])
+    return assemble_model(b, oc_offs, [sg], buf_offs)
+
+
+def make_m005_r005_while_same_subgraph() -> bytes:
+    """M005: R005 -- While body=cond 동일 인덱스 (CVE-2021-29591)"""
+    b = FlatBufferBuilder()
+    buf_offs = [build_buffer(b), build_buffer(b, b'\x01\x02\x03\x04')]
+    oc_offs = [build_opcode(b, builtin_code=82, deprecated=127)]
+
+    while_opts = build_while_options_table(b, cond_idx=1, body_idx=1)
+    t0 = build_tensor(b, 'loop_var', [1], buffer_idx=1)
+    t1 = build_tensor(b, 'output',   [1], buffer_idx=1)
+    op = build_operator(b, 0, [0], [1],
+                        builtin_options_type=119,
+                        builtin_options_ofe=while_opts)
+    sg = build_subgraph(b, [t0, t1], [op], [0], [1])
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
@@ -534,45 +546,63 @@ def make_m007_r001_r002_combo() -> bytes:
 
 
 def make_m008_r003_r004_r005_combo() -> bytes:
-    """M008: R003+R004+R005 복합 패턴"""
+    """M008: R003(SPLIT_V axis OOB)+R004(SparseAdd)+R005(While) 복합 패턴"""
+    import struct as _struct
     b = FlatBufferBuilder()
-    buf_offs = [build_buffer(b)] + [build_buffer(b, b'\x01') for _ in range(10)]
 
-    oc0 = build_opcode(b, builtin_code=0, deprecated=0)               # ADD
+    # R003용 버퍼: input[4,4], size_splits=[2,2], axis=5 (OOB)
+    buf_offs = [
+        build_buffer(b),                                      # buffer[0]: 빈(관례)
+        build_buffer(b, bytes(64)),                           # buffer[1]: SPLIT_V input [4,4]
+        build_buffer(b, _struct.pack('<2i', 2, 2)),           # buffer[2]: size_splits
+        build_buffer(b, _struct.pack('<i', 5)),               # buffer[3]: axis=5 (OOB)
+        build_buffer(b),                                      # buffer[4]: SPLIT_V out0
+        build_buffer(b),                                      # buffer[5]: SPLIT_V out1
+        build_buffer(b, b'\x01'),                             # buffer[6]: SparseAdd a_values
+        build_buffer(b, b'\x01'),                             # buffer[7]: SparseAdd a_indices
+        build_buffer(b, b'\x01'),                             # buffer[8]: SparseAdd a_shape
+        build_buffer(b, b'\x01'),                             # buffer[9]: SparseAdd b_values
+        build_buffer(b, b'\x01'),                             # buffer[10]: SparseAdd b_indices
+        build_buffer(b, b'\x01'),                             # buffer[11]: SparseAdd b_shape
+        build_buffer(b, b'\x01'),                             # buffer[12]: SparseAdd output
+        build_buffer(b, b'\x01\x02\x03\x04'),                # buffer[13]: While tensors
+    ]
+
+    oc0 = build_opcode(b, builtin_code=102, deprecated=127)              # SPLIT_V
     oc1 = build_opcode(b, builtin_code=0, custom_code='SparseAdd', deprecated=127)
-    oc2 = build_opcode(b, builtin_code=82, deprecated=127)             # While
+    oc2 = build_opcode(b, builtin_code=82, deprecated=127)               # While
     oc_offs = [oc0, oc1, oc2]
 
-    # R005: WhileOptions — cond=1, body=1 (동일 → R005 탐지)
-    # builtin_options 테이블은 Operator 테이블보다 먼저 빌드해야 한다.
-    while_opts = build_while_options_table(b, cond_idx=1, body_idx=1)
+    while_opts = build_while_options_table(b, cond_idx=1, body_idx=1)   # R005
 
-    # R003: buffer_idx=0 출력
-    t0  = build_tensor(b, 'in0',       [1,4,4,1],  buffer_idx=1)
-    t1  = build_tensor(b, 'in1',       [1,4,4,1],  buffer_idx=2)
-    t2  = build_tensor(b, 'out_buf0',  [1,4,4,1],  buffer_idx=0)   # ← R003
-    # R004: SparseAdd 불일치
-    t3  = build_tensor(b, 'sa_aval',   [5],         buffer_idx=3)
-    t4  = build_tensor(b, 'sa_aidx',   [5,3],       buffer_idx=4)
-    t5  = build_tensor(b, 'sa_ashp',   [4],         buffer_idx=5)  # ← R004 (3!=4)
-    t6  = build_tensor(b, 'sa_bval',   [3],         buffer_idx=6)
-    t7  = build_tensor(b, 'sa_bidx',   [3,2],       buffer_idx=7)
-    t8  = build_tensor(b, 'sa_bshp',   [2],         buffer_idx=8)
-    t9  = build_tensor(b, 'sa_out',    [8],         buffer_idx=9)
+    # R003: SPLIT_V axis=5, input rank=2
+    t0  = build_tensor(b, 'sv_input',   [4, 4], tensor_type=1, buffer_idx=1)
+    t1  = build_tensor(b, 'sv_splits',  [2],    tensor_type=2, buffer_idx=2)
+    t2  = build_tensor(b, 'sv_axis',    [],     tensor_type=2, buffer_idx=3)  # axis=5
+    t3  = build_tensor(b, 'sv_out0',    [2, 4], tensor_type=1, buffer_idx=4)
+    t4  = build_tensor(b, 'sv_out1',    [2, 4], tensor_type=1, buffer_idx=5)
+    # R004: SparseAdd indices/shape 불일치
+    t5  = build_tensor(b, 'sa_aval',    [5],    buffer_idx=6)
+    t6  = build_tensor(b, 'sa_aidx',    [5, 3], buffer_idx=7)
+    t7  = build_tensor(b, 'sa_ashp',    [4],    buffer_idx=8)   # 3 != 4 → R004
+    t8  = build_tensor(b, 'sa_bval',    [3],    buffer_idx=9)
+    t9  = build_tensor(b, 'sa_bidx',    [3, 2], buffer_idx=10)
+    t10 = build_tensor(b, 'sa_bshp',    [2],    buffer_idx=11)
+    t11 = build_tensor(b, 'sa_out',     [8],    buffer_idx=12)
     # R005: While 동일 서브그래프
-    t10 = build_tensor(b, 'while_in',  [1],         buffer_idx=1)
-    t11 = build_tensor(b, 'while_out', [1],         buffer_idx=1)
+    t12 = build_tensor(b, 'while_in',   [1],    buffer_idx=13)
+    t13 = build_tensor(b, 'while_out',  [1],    buffer_idx=13)
 
-    op0 = build_operator(b, 0, [0,1], [2])
-    op1 = build_operator(b, 1, [3,4,5,6,7,8], [9])
-    op2 = build_operator(b, 2, [10], [11],
+    op0 = build_operator(b, 0, [0, 1, 2], [3, 4])           # SPLIT_V
+    op1 = build_operator(b, 1, [5, 6, 7, 8, 9, 10], [11])   # SparseAdd
+    op2 = build_operator(b, 2, [12], [13],                   # While
                          builtin_options_type=119,
                          builtin_options_ofe=while_opts)
 
     sg = build_subgraph(b,
-                        [t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11],
-                        [op0,op1,op2],
-                        [0], [11])
+                        [t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13],
+                        [op0, op1, op2],
+                        [0], [13])
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
@@ -632,24 +662,31 @@ def make_b012_variable_tensor_not_input() -> bytes:
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
-def make_b013_buffer0_input_only() -> bytes:
+def make_b013_splitv_valid_axis() -> bytes:
     """
-    B013: R003 유사 패턴 — buffer_idx=0 텐서가 존재하지만
-    연산자 출력이 아닌 서브그래프 입력(placeholder)으로만 사용
-    (연산자 출력 = 버퍼 메모리 할당이 필요하지만,
-     서브그래프 입력 = 런타임이 외부에서 제공하므로 buffer=0 허용)
+    B013: R003 유사 패턴 — SPLIT_V 연산자이지만 axis=1 (rank=2 이내, 정상)
+    axis가 [0, rank) 범위 내이므로 R003이 탐지되어서는 안 된다.
     """
+    import struct as _struct
     b = FlatBufferBuilder()
-    buf_offs = [build_buffer(b), build_buffer(b, b'\x01\x02')]
-    oc_offs  = [build_opcode(b, 0, deprecated=0)]
+    buf_offs = [
+        build_buffer(b),
+        build_buffer(b, bytes(64)),                   # input [4,4] float32
+        build_buffer(b, _struct.pack('<2i', 2, 2)),   # size_splits=[2,2]
+        build_buffer(b, _struct.pack('<i', 1)),       # axis=1 (정상: rank=2 이내)
+        build_buffer(b),                              # output0
+        build_buffer(b),                              # output1
+    ]
+    oc_offs = [build_opcode(b, builtin_code=102, deprecated=127)]  # SPLIT_V
 
-    # buffer_idx=0인 텐서가 서브그래프 입력(placeholder)으로만 사용 → 정상
-    t0 = build_tensor(b, 'placeholder_in', [1, 4, 4, 1], buffer_idx=0)
-    t1 = build_tensor(b, 'weights',        [1, 4, 4, 1], buffer_idx=1)
-    t2 = build_tensor(b, 'output',         [1, 4, 4, 1], buffer_idx=1)
+    t0 = build_tensor(b, 'input',       [4, 4], tensor_type=1, buffer_idx=1)
+    t1 = build_tensor(b, 'size_splits', [2],    tensor_type=2, buffer_idx=2)
+    t2 = build_tensor(b, 'axis',        [],     tensor_type=2, buffer_idx=3)  # axis=1 → 정상
+    t3 = build_tensor(b, 'output0',     [4, 2], tensor_type=1, buffer_idx=4)
+    t4 = build_tensor(b, 'output1',     [4, 2], tensor_type=1, buffer_idx=5)
 
-    op = build_operator(b, 0, [0, 1], [2])   # t0 입력, t2 출력 (buffer_idx=1 → 정상)
-    sg = build_subgraph(b, [t0, t1, t2], [op], inputs=[0], outputs=[2])
+    op = build_operator(b, 0, [0, 1, 2], [3, 4])
+    sg = build_subgraph(b, [t0, t1, t2, t3, t4], [op], [0], [3, 4])
     return assemble_model(b, oc_offs, [sg], buf_offs)
 
 
@@ -715,15 +752,15 @@ MODEL_SPECS = [
     # FPR 측정용 "유사 패턴" 정상 모델 (B011-B015)
     ('B011.tflite', 'FPR용: 동적 shape(-1) 정상 사용',    make_b011_dynamic_shape_minus1),
     ('B012.tflite', 'FPR용: is_variable 텐서 미참조',      make_b012_variable_tensor_not_input),
-    ('B013.tflite', 'FPR용: buffer_idx=0 입력 텐서',       make_b013_buffer0_input_only),
+    ('B013.tflite', 'FPR용: SPLIT_V axis 정상(범위 내)',    make_b013_splitv_valid_axis),
     ('B014.tflite', 'FPR용: SparseAdd 정상(일치)',         make_b014_sparseadd_matching),
     ('B015.tflite', 'FPR용: While 다른 서브그래프 인덱스', make_b015_while_different_subgraph),
     ('M001.tflite', 'R001: 대형 shape (2^31)',             make_m001_r001_large_shape),
-    ('M002.tflite', 'R001: 음수 shape (-2)',               make_m002_r001_negative_shape),
-    ('M003.tflite', 'R002: is_variable 텐서 입력 참조',    make_m003_r002_variable_input),
-    ('M004.tflite', 'R003: buffer_idx=0 출력 텐서',        make_m004_r003_buffer0_output),
-    ('M005.tflite', 'R004: SparseAdd indices/shape 불일치', make_m005_r004_sparseadd_mismatch),
-    ('M006.tflite', 'R005: While body=cond 동일',          make_m006_r005_while_same_subgraph),
+    ('M002.tflite', 'R002: is_variable 텐서 입력 참조',    make_m002_r002_variable_input),
+    ('M003.tflite', 'R003: SPLIT_V axis OOB',              make_m003_r003_splitv_oob),
+    ('M004.tflite', 'R004: SparseAdd indices/shape 불일치', make_m004_r004_sparseadd_mismatch),
+    ('M005.tflite', 'R005: While body=cond 동일 (v1)',     make_m005_r005_while_same_subgraph),
+    ('M006.tflite', 'R005: While body=cond 동일 (v2)',     make_m006_r005_while_same_subgraph),
     ('M007.tflite', 'R001+R002 복합',                      make_m007_r001_r002_combo),
     ('M008.tflite', 'R003+R004+R005 복합',                 make_m008_r003_r004_r005_combo),
 ]

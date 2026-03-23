@@ -34,7 +34,7 @@ GROUND_TRUTH = {
     # FPR 측정용 유사 패턴 정상 모델 (취약점 없음 = 0)
     "B011.tflite": 0,   # 동적 shape -1 (정상)
     "B012.tflite": 0,   # is_variable 텐서 미참조 (정상)
-    "B013.tflite": 0,   # buffer_idx=0 입력용 (정상)
+    "B013.tflite": 0,   # SPLIT_V axis 정상 범위 (정상)
     "B014.tflite": 0,   # SparseAdd 차원 일치 (정상)
     "B015.tflite": 0,   # While 다른 서브그래프 (정상)
     "M001.tflite": 1, "M002.tflite": 1, "M003.tflite": 1,
@@ -47,7 +47,8 @@ GROUND_TRUTH = {
 FP_RISK = {
     "B011.tflite": {"R001": True,  "note": "동적 shape -1을 취약점으로 오인"},
     "B012.tflite": {"R002": False, "note": "미참조 is_variable → 정상 탐지"},
-    "B013.tflite": {"R003": False, "note": "입력 placeholder → 정상 탐지"},
+    # [수정] R003 탐지 조건이 'SPLIT_V axis 범위 위반'으로 변경됨에 따라 주석 갱신
+    "B013.tflite": {"R003": False, "note": "SPLIT_V axis 정상 범위(0 ≤ axis < rank) → 정상 탐지"},
     "B014.tflite": {"R004": False, "note": "차원 일치 → 정상 탐지"},
     "B015.tflite": {"R005": False, "note": "다른 인덱스 → 정상 탐지"},
 }
@@ -61,29 +62,29 @@ MODEL_TYPES = {
 # 예상 취약점 규칙 (모델별 기대 탐지 규칙)
 EXPECTED_RULES = {
     "M001.tflite": {"R001"},
-    "M002.tflite": {"R001"},
-    "M003.tflite": {"R002"},
-    "M004.tflite": {"R003"},
-    "M005.tflite": {"R004"},
+    "M002.tflite": {"R002"},
+    "M003.tflite": {"R003"},
+    "M004.tflite": {"R004"},
+    "M005.tflite": {"R005"},
     "M006.tflite": {"R005"},
     "M007.tflite": {"R001", "R002"},
     "M008.tflite": {"R003", "R004", "R005"},
 }
 
 # ANSI 컬러
-CYAN  = "\033[96m"
-GREEN = "\033[92m"
-RED   = "\033[91m"
+CYAN   = "\033[96m"
+GREEN  = "\033[92m"
+RED    = "\033[91m"
 YELLOW = "\033[93m"
-BOLD  = "\033[1m"
-RESET = "\033[0m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
 
 # ──────────────────────────────────────────────
 # 단계 1: 테스트 모델 생성
 # ──────────────────────────────────────────────
 
 def step1_generate_models(model_dir: str):
-    """generate_test_models.py를 호출하여 18개 모델 생성"""
+    """generate_test_models.py를 호출하여 23개 모델 생성"""
     print(f"\n{BOLD}{'='*65}{RESET}")
     print(f"{BOLD}  단계 1: 테스트 모델 생성{RESET}")
     print(f"{'='*65}")
@@ -101,7 +102,7 @@ def step2_analyze_models(model_dir: str) -> list:
     print(f"{'='*65}")
 
     model_path = Path(model_dir)
-    # 파일명 정렬: B001-B010, M001-M008 순서 보장
+    # 파일명 정렬: B001-B015, M001-M008 순서 보장
     all_files = sorted(model_path.glob("*.tflite"),
                        key=lambda p: p.name)
 
@@ -115,12 +116,12 @@ def step2_analyze_models(model_dir: str) -> list:
         t_end   = time.perf_counter()
 
         elapsed = t_end - t_start
-        result["elapsed"] = elapsed
+        result["elapsed"]    = elapsed
         result["model_type"] = MODEL_TYPES.get(fpath.name, "Unknown")
 
-        # 탐지된 규칙 집합
+        # [수정] set → sorted list 변환: 재현성 보장 및 results.json diff 노이즈 제거
         detected_rules = {f["rule"] for f in result["findings"]}
-        result["detected_rules"] = list(detected_rules)
+        result["detected_rules"] = list(sorted(detected_rules))
 
         # 탐지 여부 (findings가 1개 이상이면 탐지)
         result["detected"] = len(result["findings"]) > 0
@@ -140,13 +141,12 @@ def step2_analyze_models(model_dir: str) -> list:
 def step3_print_table3(results: list):
     """
     Table 3 형식으로 결과 출력
-    Model | Type | Size(KB) | Tensors | Ops | Findings | W | C(M) | R(M) | Time(s)
+    Model | Type | Size(KB) | Tensors | Ops | Findings | W | C(M) | R(M) | Time(ms)
     """
     print(f"\n{BOLD}{'='*65}{RESET}")
     print(f"{BOLD}  Table 3: 분석 결과 요약{RESET}")
     print(f"{'='*65}")
 
-    # 헤더
     header = (
         f"{'Model':<10} {'Type':<10} {'Size(KB)':>8} "
         f"{'Tensors':>7} {'Ops':>5} {'Findings':>8} "
@@ -168,12 +168,7 @@ def step3_print_table3(results: list):
         R        = r["R"]
         elapsed  = r["elapsed"] * 1000  # ms
 
-        # 취약 모델은 빨간색, 정상 모델은 기본색
-        if mtype == "Malicious":
-            line_color = YELLOW
-        else:
-            line_color = ""
-
+        line_color = YELLOW if mtype == "Malicious" else ""
         line = (
             f"{fname:<10} {mtype:<10} {size_kb:>8.2f} "
             f"{tensors:>7} {ops:>5} {findings:>8} "
@@ -202,7 +197,7 @@ def step4_compute_metrics(results: list):
     print(f"{'='*65}")
 
     TP = FP = TN = FN = 0
-    rule_stats = {}  # rule_id → {TP, FP, FN}
+    rule_stats = {}  # rule_id → {TP, FN}
 
     for r in results:
         fname    = r["filename"]
@@ -240,7 +235,7 @@ def step4_compute_metrics(results: list):
     f1        = (2 * precision * recall / (precision + recall)
                  if (precision + recall) > 0 else 0.0)
 
-    print(f"  {'혼동 행렬':}")
+    print(f"  혼동 행렬")
     print(f"    TP={TP}  FP={FP}  TN={TN}  FN={FN}")
     print()
     print(f"  {'Detection Rate (Recall)':30s}: {GREEN}{recall*100:.1f}%{RESET}")
@@ -249,7 +244,7 @@ def step4_compute_metrics(results: list):
     print(f"  {'F1 Score':30s}: {f1*100:.1f}%")
     print()
 
-    print(f"  {'규칙별 탐지 현황':}")
+    print(f"  규칙별 탐지 현황")
     print(f"  {'Rule':<8} {'TP':>4} {'FN':>4} {'Recall':>8}")
     print(f"  {'-'*28}")
     for rule in sorted(rule_stats.keys()):
@@ -262,10 +257,10 @@ def step4_compute_metrics(results: list):
 
     return {
         "TP": TP, "FP": FP, "TN": TN, "FN": FN,
-        "recall": recall,
-        "fpr": fpr,
+        "recall":    recall,
+        "fpr":       fpr,
         "precision": precision,
-        "f1": f1,
+        "f1":        f1,
         "rule_stats": rule_stats,
     }
 
@@ -280,12 +275,11 @@ def step5_save_results(results: list, metrics: dict, output_file: str):
     print(f"{BOLD}  단계 5: 결과 저장{RESET}")
     print(f"{'='*65}")
 
-    # JSON 직렬화를 위해 bytes 타입 변환
     def _clean(obj):
         if isinstance(obj, bytes):
             return obj.hex()
         if isinstance(obj, set):
-            return list(obj)
+            return sorted(obj)   # set도 정렬하여 저장
         return obj
 
     output = {
@@ -297,22 +291,22 @@ def step5_save_results(results: list, metrics: dict, output_file: str):
 
     for r in results:
         entry = {
-            "filename":     r["filename"],
-            "model_type":   r["model_type"],
-            "file_size_kb": round(r["file_size"] / 1024.0, 2),
-            "version":      r["version"],
-            "subgraphs":    r["subgraphs"],
-            "tensors":      r["tensors"],
-            "operators":    r["operators"],
-            "buffers":      r["buffers"],
+            "filename":       r["filename"],
+            "model_type":     r["model_type"],
+            "file_size_kb":   round(r["file_size"] / 1024.0, 2),
+            "version":        r["version"],
+            "subgraphs":      r["subgraphs"],
+            "tensors":        r["tensors"],
+            "operators":      r["operators"],
+            "buffers":        r["buffers"],
             "findings_count": len(r["findings"]),
-            "detected_rules": r["detected_rules"],
-            "W":   round(r["W"], 4),
-            "C":   round(r["C"], 4),
-            "R":   round(r["R"], 4),
-            "elapsed_ms": round(r["elapsed"] * 1000, 4),
-            "ground_truth": GROUND_TRUTH.get(r["filename"], -1),
-            "detected":     r["detected"],
+            "detected_rules": r["detected_rules"],  # 이미 sorted list
+            "W":              round(r["W"], 4),
+            "C":              round(r["C"], 4),
+            "R":              round(r["R"], 4),
+            "elapsed_ms":     round(r["elapsed"] * 1000, 4),
+            "ground_truth":   GROUND_TRUTH.get(r["filename"], -1),
+            "detected":       r["detected"],
             "findings": [
                 {
                     "rule":     f["rule"],
@@ -330,7 +324,8 @@ def step5_save_results(results: list, metrics: dict, output_file: str):
         json.dump(output, fp, ensure_ascii=False, indent=2, default=_clean)
 
     print(f"  결과 저장 완료: {out_path.resolve()}")
-    print(f"  총 {len(results)}개 모델, {sum(len(r['findings']) for r in results)}건 발견 사항")
+    print(f"  총 {len(results)}개 모델, "
+          f"{sum(len(r['findings']) for r in results)}건 발견 사항")
 
 
 # ──────────────────────────────────────────────
@@ -398,7 +393,8 @@ def main():
     results = step2_analyze_models(args.model_dir)
 
     if not results:
-        print(f"{RED}[오류] 분석할 모델이 없습니다. {args.model_dir} 디렉터리를 확인하세요.{RESET}")
+        print(f"{RED}[오류] 분석할 모델이 없습니다. "
+              f"{args.model_dir} 디렉터리를 확인하세요.{RESET}")
         sys.exit(1)
 
     # 단계 3: Table 3 출력

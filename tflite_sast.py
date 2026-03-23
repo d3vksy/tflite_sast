@@ -33,9 +33,10 @@ SEVERITY_COLOR = {
 SEVERITY_WEIGHT = {"CRITICAL": 10, "HIGH": 5, "MEDIUM": 2, "LOW": 1}
 
 # BuiltinOperator 상수 (schema.fbs 기준)
-BUILTIN_WHILE = 82
-BUILTIN_ADD   = 0
+BUILTIN_WHILE    = 82
+BUILTIN_ADD      = 0
 BUILTIN_SPARSE_TO_DENSE = 100
+BUILTIN_SPLIT_V  = 102
 
 # ──────────────────────────────────────────────
 # FlatBuffer 저수준 유틸리티
@@ -165,6 +166,31 @@ def _read_scalar_u8(buf, table_offset, field_id, default=0):
         return default
     return _read_u8(buf, off)
 
+def _read_raw_bytes(buf, table_offset, field_id):
+    """uint8 벡터 필드를 bytes로 읽기 (Buffer.data 등 1바이트 요소)"""
+    field_off = _vtable_field(buf, table_offset, field_id)
+    if field_off is None:
+        return None
+    if field_off + 4 > len(buf):
+        return None
+    raw = _read_u32(buf, field_off)
+    vec_start = field_off + raw
+    if vec_start + 4 > len(buf):
+        return None
+    count = _read_u32(buf, vec_start)
+    if count > len(buf):
+        return None
+    data_end = vec_start + 4 + count
+    if data_end > len(buf):
+        return None
+    return bytes(buf[vec_start + 4: data_end])
+
+def _parse_buffer(buf, tbl):
+    """Buffer 테이블 파싱: field 0 = data (uint8[])"""
+    b = TFLiteBuffer()
+    b.data = _read_raw_bytes(buf, tbl, 0)
+    return b
+
 def _read_string(buf, table_offset, field_id):
     """FlatBuffer 문자열 필드 읽기 — UTF-8 디코딩"""
     off = _vtable_field(buf, table_offset, field_id)
@@ -184,6 +210,13 @@ def _read_string(buf, table_offset, field_id):
 
 # TFLite FlatBuffer 파일 식별자 (schema.fbs file_identifier = "TFL3")
 TFLITE_FILE_IDENTIFIER = b"TFL3"
+
+class TFLiteBuffer:
+    """TFLite 버퍼 데이터 구조"""
+    __slots__ = ("data",)
+
+    def __init__(self):
+        self.data = None   # bytes | None
 
 class TFLiteTensor:
     """TFLite 텐서 데이터 구조"""
@@ -370,9 +403,9 @@ def parse_tflite(data: bytes) -> TFLiteModel:
     for tbl_sg in _read_vector_of_tables(data, root, 2):
         model.subgraphs.append(_parse_subgraph(data, tbl_sg))
 
-    # buffers 개수만 파악 (field 4)
-    buf_count, _ = _read_vector(data, root, 4)
-    model.buffers = list(range(buf_count))  # 인덱스 목록으로 저장
+    # buffers 파싱 (field 4) — TFLiteBuffer 객체 리스트
+    for tbl_buf in _read_vector_of_tables(data, root, 4):
+        model.buffers.append(_parse_buffer(data, tbl_buf))
 
     return model
 
@@ -411,7 +444,7 @@ def _check_r001(model: TFLiteModel):
 
 def _check_r002(model: TFLiteModel):
     """
-    R002 (HIGH) CVE-2021-37681
+    R002 (MEDIUM) CVE-2021-37681
     is_variable=true인 텐서가 연산자 입력으로 직접 참조되는 경우
     """
     findings = []
@@ -429,7 +462,7 @@ def _check_r002(model: TFLiteModel):
                 if inp in var_indices:
                     findings.append({
                         "rule":     "R002",
-                        "severity": "HIGH",
+                        "severity": "MEDIUM",
                         "cve":      "CVE-2021-37681",
                         "message":  (
                             f"서브그래프[{sg_idx}] 연산자[{op_idx}] 입력에 "
@@ -441,38 +474,57 @@ def _check_r002(model: TFLiteModel):
 
 def _check_r003(model: TFLiteModel):
     """
-    R003 (HIGH) CVE-2021-29606
-    buffer_idx=0인 상수 버퍼가 연산자 출력 텐서로 지정된 경우
-    (buffer 0은 항상 빈 버퍼여야 하는 특수 슬롯)
+    R003 (MEDIUM) CVE-2021-29606
+    SPLIT_V 연산자의 axis 값이 입력 텐서의 rank 범위 밖인 경우
+    (split_v.cc SizeOfDimension() 힙 OOB 읽기)
+    SPLIT_V builtin_code = 102
+    inputs: [input_tensor(0), size_splits(1), axis(2)]
     """
     findings = []
 
-    for sg_idx, sg in enumerate(model.subgraphs):
-        # buffer_idx=0인 텐서 인덱스
-        buf0_tensors = {
-            i for i, t in enumerate(sg.tensors) if t.buffer_idx == 0
-        }
-        if not buf0_tensors:
-            continue
+    split_v_opcodes = {
+        i for i, oc in enumerate(model.operator_codes)
+        if oc.builtin_code == BUILTIN_SPLIT_V
+    }
+    if not split_v_opcodes:
+        return findings
 
+    for sg_idx, sg in enumerate(model.subgraphs):
         for op_idx, op in enumerate(sg.operators):
-            for out in op.outputs:
-                if out in buf0_tensors:
-                    findings.append({
-                        "rule":     "R003",
-                        "severity": "HIGH",
-                        "cve":      "CVE-2021-29606",
-                        "message":  (
-                            f"서브그래프[{sg_idx}] 연산자[{op_idx}] 출력 텐서[{out}]의 "
-                            f"buffer_idx=0 (예약 버퍼 슬롯 오용)"
-                        ),
-                    })
+            if op.opcode_index not in split_v_opcodes:
+                continue
+            if len(op.inputs) < 3:
+                continue
+
+            input_tensor = sg.tensors[op.inputs[0]]
+            axis_tensor  = sg.tensors[op.inputs[2]]
+            rank = len(input_tensor.shape)
+
+            buf_idx = axis_tensor.buffer_idx
+            if buf_idx >= len(model.buffers):
+                continue
+            buf = model.buffers[buf_idx]
+            if buf.data is None or len(buf.data) < 4:
+                continue
+            axis_value = struct.unpack_from('<i', buf.data, 0)[0]
+
+            if axis_value < 0 or axis_value >= rank:
+                findings.append({
+                    "rule":     "R003",
+                    "severity": "MEDIUM",
+                    "cve":      "CVE-2021-29606",
+                    "message":  (
+                        f"서브그래프[{sg_idx}] SPLIT_V 연산자[{op_idx}] "
+                        f"axis={axis_value} out of range [0, {rank}) "
+                        f"for input rank={rank}"
+                    ),
+                })
     return findings
 
 
 def _check_r004(model: TFLiteModel):
     """
-    R004 (MEDIUM) CVE-2021-29609
+    R004 (HIGH) CVE-2021-29609
     SparseAdd 연산자에서 *_indices 2차원과 *_shape 크기가 불일치하는 경우
     SparseAdd는 custom_code="SparseAdd"로 식별
     입력 순서: [a_values, a_indices, a_shape, b_values, b_indices, b_shape, ...]
@@ -509,7 +561,7 @@ def _check_r004(model: TFLiteModel):
                 if a_idx_shape[1] != a_shp_shape[0]:
                     findings.append({
                         "rule":     "R004",
-                        "severity": "MEDIUM",
+                        "severity": "HIGH",
                         "cve":      "CVE-2021-29609",
                         "message":  (
                             f"서브그래프[{sg_idx}] SparseAdd 연산자[{op_idx}] "
@@ -526,7 +578,7 @@ def _check_r004(model: TFLiteModel):
                 if b_idx_shape[1] != b_shp_shape[0]:
                     findings.append({
                         "rule":     "R004",
-                        "severity": "MEDIUM",
+                        "severity": "HIGH",
                         "cve":      "CVE-2021-29609",
                         "message":  (
                             f"서브그래프[{sg_idx}] SparseAdd 연산자[{op_idx}] "
@@ -583,40 +635,41 @@ def _check_r005(model: TFLiteModel):
 def compute_risk_score(findings):
     """
     위험도 점수 R(M) 계산
-    W(M) = 10*n_C + 5*n_H + 2*n_M + n_L
+
+    W(M) = 10*n_C + 5*n_H + 2*n_M
     p_s  = (w_s * n_s) / W(M)
     H(p) = -sum(p_s * log2(p_s))  for p_s > 0
-    C(M) = 1 - H(p) / log2(4)     in [0, 1]
+    C(M) = 1 - H(p) / log2(3)     in [0, 1]
+           (CRITICAL/HIGH/MEDIUM 3개 등급 기준 정규화)
     R(M) = log2(1 + W(M) + C(M))
     W(M)=0이면 R(M)=0
+
+    심각도 분류 기준 (pre-deployment 정적 탐지 관점):
+      CRITICAL: 모델 로딩 즉시 트리거, 메모리 손상 확실 (Integer Overflow)
+      HIGH:     조건 충족 시 크래시/메모리 손상 (OOB Write, Stack Overflow)
+      MEDIUM:   특정 실행 경로 필요, 영향 제한적 (NULL Deref, OOB Read)
     """
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
     for f in findings:
-        sev = f.get("severity", "LOW")
+        sev = f.get("severity", "MEDIUM")
         counts[sev] = counts.get(sev, 0) + 1
 
-    n_C, n_H, n_M, n_L = (
-        counts["CRITICAL"], counts["HIGH"],
-        counts["MEDIUM"],   counts["LOW"]
-    )
-    W = 10 * n_C + 5 * n_H + 2 * n_M + n_L
+    n_C, n_H, n_M = counts["CRITICAL"], counts["HIGH"], counts["MEDIUM"]
+    W = 10 * n_C + 5 * n_H + 2 * n_M
 
     if W == 0:
         return 0.0, 0.0, 0.0
 
     # 엔트로피 기반 복잡도 C(M)
     probs = []
-    for sev, w_s, n_s in [
-        ("CRITICAL", 10, n_C),
-        ("HIGH",      5, n_H),
-        ("MEDIUM",    2, n_M),
-        ("LOW",       1, n_L),
-    ]:
+    for w_s, n_s in [(10, n_C), (5, n_H), (2, n_M)]:
         if n_s > 0:
             probs.append((w_s * n_s) / W)
 
     H = -sum(p * math.log2(p) for p in probs if p > 0)
-    C = 1.0 - H / math.log2(4) if H > 0 else 1.0
+    # 3개 심각도 등급(CRITICAL/HIGH/MEDIUM) 기준으로 정규화
+    # 3개 등급 균등 분포 시 C=0, 단일 등급 집중 시 C=1
+    C = 1.0 - H / math.log2(3) if H > 0 else 1.0
     C = max(0.0, min(1.0, C))  # [0, 1] 클리핑
 
     R = math.log2(1 + W + C)
