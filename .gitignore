@@ -1,9 +1,11 @@
 /.claude
-/p.md
-/paper.md
-/real_models.zip
-/RESEARCH_OVERVIEW.md
-/results.json
-/test.c
+/v1/p.md
+/v1/paper.md
+/v1/real_models.zip
+/v1/RESEARCH_OVERVIEW.md
+/v1/results.json
+/v1/test.c
+/v1/real_models/
+/v1/test_models/
 /__pycache__
 /해야할것.md
